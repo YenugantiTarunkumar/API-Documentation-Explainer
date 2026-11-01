@@ -58,6 +58,18 @@ def get_provider_config(provider: str) -> dict:
         ) from exc
 
 
+def get_provider_api_key(provider: str) -> str:
+    """Return a configured provider key without logging or exposing its value."""
+    config = get_provider_config(provider)
+    api_key = os.getenv(config["api_key_env"], "").strip()
+    if not api_key:
+        raise LLMProviderError(
+            f"{config['label']} is not configured. "
+            f"Set {config['api_key_env']} in the server environment."
+        )
+    return api_key
+
+
 def provider_catalog() -> list[dict]:
     """Return provider metadata without exposing API keys."""
     return [
@@ -98,11 +110,7 @@ def _record_usage(data: dict) -> None:
 def build_llm_request(prompt: str, provider: str) -> tuple[str, dict, dict]:
     """Build an OpenAI-compatible request for a configured provider."""
     config = get_provider_config(provider)
-    api_key = os.getenv(config["api_key_env"])
-    if not api_key:
-        raise LLMProviderError(
-            f"{config['label']} is not configured. Add {config['api_key_env']} to .env."
-        )
+    api_key = get_provider_api_key(provider)
 
     payload = {
         "model": config["model"],
@@ -482,8 +490,13 @@ async def query_llm(prompt: str, provider: str = "groq") -> str:
         else:
             detail = f"request failed with HTTP {status}"
         raise LLMProviderError(f"{config['label']} {detail}.") from e
+    except httpx.TimeoutException as e:
+        logger.error(f"{config['label']} request timed out.")
+        raise LLMProviderError(
+            f"{config['label']} request timed out. Try again."
+        ) from e
     except httpx.RequestError as e:
-        logger.error(f"{config['label']} request failed: {e}.")
+        logger.error(f"{config['label']} request failed.")
         raise LLMProviderError(
             f"Could not reach {config['label']}. Check your connection and try again."
         ) from e

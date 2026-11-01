@@ -1,238 +1,248 @@
-import os, pickle, chromadb
-from dotenv import load_dotenv
-from typing import List, Dict
-from sentence_transformers import SentenceTransformer, CrossEncoder
+
+import hashlib
+import os
+import pickle
+from pathlib import Path
+from typing import Dict, List
+
 from rank_bm25 import BM25Okapi
 from loggerConfig import get_logger
 
-load_dotenv()
-os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN", "")
 logger = get_logger("vector_store")
 
-BM25 = "./bm25_indexes"
-os.makedirs(BM25, exist_ok=True)
+BM25 = Path(__file__).resolve().parent / "bm25_indexes"
+LEGACY_BM25_DIRS = (Path(__file__).resolve().parent.parent / "bm25_indexes",)
+BM25.mkdir(parents=True, exist_ok=True)
 
-# Embedding model, cross-encoder model & ChromaDB initialization 
-try:
-    logger.info("Loading embedding model...")
-    embedder = SentenceTransformer("all-mpnet-base-v2")
-    logger.info("Embedding model loaded successfully.")
-except Exception as e:
-    logger.critical(f"Failed to load embedding model: {e}")
-    raise
 
-try:
-    logger.info("Loading cross-encoder re-ranking model...")
-    cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-V2")
-    logger.info("Cross-encoder loaded successfully.")
-except Exception as e:
-    logger.critical(f"Failed to load cross-encoder: {e}")
-    raise
-
-try:
-    logger.info("Initializing ChromaDB client...")
-    client = chromadb.PersistentClient(path="./chromaDB")
-    logger.info("ChromaDB client initialized.")
-except Exception as e:
-    logger.critical(f"Failed to initialize ChromaDB: {e}")
-    raise
-
-# Helper
 def normalize_name(specification_name: str) -> str:
-    """Normalize a specification name to a valid ChromaDB collection name."""
-    name = specification_name.lower().replace(" ", "_").replace("-", "_").replace(".", "_")
-    name = ''.join(c for c in name if c.isalnum() or c == '_')
-    name = name.strip('_')[:50]
-    # Ensure minimum 3 characters
+    """Create a readable, filesystem-safe prefix for a specification name."""
+    name = (
+        specification_name.lower()
+        .strip()
+        .replace(" ", "_")
+        .replace("-", "_")
+        .replace(".", "_")
+    )
+    name = "".join(c for c in name if c.isalnum() or c == "_")
+    name = name.strip("_")[:50]
     if len(name) < 3:
-        name = name + "_api"    
+        name += "_api"
     return name
 
+
 def bm25_path(specification_name: str) -> str:
-    return os.path.join(BM25, f"{normalize_name(specification_name)}.pkl")
- 
+    digest = hashlib.sha256(
+        specification_name.strip().encode("utf-8")
+    ).hexdigest()[:16]
+    return str(Path(BM25) / f"{normalize_name(specification_name)}-{digest}.pkl")
+
+
+def _legacy_bm25_paths(specification_name: str) -> list[Path]:
+    filename = f"{normalize_name(specification_name)}.pkl"
+    directories = (Path(BM25), *LEGACY_BM25_DIRS)
+    return list(dict.fromkeys(directory / filename for directory in directories))
+
+
 def tokenize(text: str) -> List[str]:
-    """Lowercase whitespace tokenization - fast and good enough for BM25."""
+    """Simple tokenization for BM25 keyword search."""
     return text.lower().split()
 
-# Store 
+
+def _payload_specification_name(payload: Dict) -> str | None:
+    name = payload.get("specification_name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+
+    for chunk in payload.get("chunks", []):
+        metadata = chunk.get("metadata", {}) if isinstance(chunk, dict) else {}
+        name = metadata.get("specification_name") if isinstance(metadata, dict) else None
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+
+    for chunk in payload.get("chunks", []):
+        metadata = chunk.get("metadata", {}) if isinstance(chunk, dict) else {}
+        source_file = metadata.get("source_file") if isinstance(metadata, dict) else None
+        if isinstance(source_file, str) and source_file.strip():
+            name = Path(source_file).stem.strip()
+            if name:
+                return name
+    return None
+
+
+def _read_index(path: Path) -> Dict | None:
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        with path.open("rb") as index_file:
+            payload = pickle.load(index_file)
+        if (
+            not isinstance(payload, dict)
+            or not callable(getattr(payload.get("bm25"), "get_scores", None))
+            or not isinstance(payload.get("chunks"), list)
+            or any(
+                not isinstance(chunk, dict)
+                or not isinstance(chunk.get("text"), str)
+                for chunk in payload["chunks"]
+            )
+        ):
+            logger.warning(f"Skipping invalid BM25 index '{path.name}'.")
+            return None
+        return payload
+    except Exception as e:
+        logger.warning(f"Could not read BM25 index '{path.name}': {e}")
+        return None
+
+
 def store_chunks(chunks: List[Dict], specification_name: str) -> int:
     if not chunks:
         logger.warning("No chunks provided for storage.")
         return 0
-    try:
-        name = normalize_name(specification_name)
-        # Get the collection if it exists, otherwise create it
-        collection = client.get_or_create_collection(name)
-    except Exception as e:
-        logger.error(f"Failed to get/create collection: {e}")
+    if not isinstance(specification_name, str) or not specification_name.strip():
+        logger.error("A non-empty specification name is required.")
         return 0
+    if any(
+        not isinstance(chunk, dict)
+        or not isinstance(chunk.get("text"), str)
+        or not chunk["text"].strip()
+        for chunk in chunks
+    ):
+        logger.warning("Chunks must contain non-empty text.")
+        return 0
+
     try:
         texts = [c["text"] for c in chunks]
-        metadatas = [c["metadata"] for c in chunks]
-        ids = [f"{specification_name}_{i}" for i in range(len(chunks))]
-    except KeyError as e:
-        logger.error(f"Missing expected key in chunks: {e}")
-        return 0
-    try:
-        logger.info(f"Embedding {len(chunks)} chunks...")
-        embeddings = embedder.encode(texts, show_progress_bar=True).tolist()
-    except Exception as e:
-        logger.error(f"Embedding failed: {e}")
-        return 0
-    try:
-        collection.add(
-            documents=texts,
-            embeddings=embeddings,
-            metadatas=metadatas,
-            ids=ids
-        )
-        logger.info(f"Stored {len(chunks)} chunks for '{specification_name}'")
-    except Exception as e:
-        logger.error(f"Failed to store chunks: {e}")
-        return 0
-    try:
-        tokenized = [tokenize(t) for t in texts]
+        tokenized = [tokenize(text) for text in texts]
         bm25 = BM25Okapi(tokenized)
-        payload = {"bm25": bm25, "chunks": chunks}
-        with open(bm25_path(specification_name), "wb") as f:
-            pickle.dump(payload, f)
-        logger.info(f"BM25 index built and saved for '{specification_name}'.")
+        path = Path(bm25_path(specification_name))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_suffix(path.suffix + ".tmp")
+        with temporary_path.open("wb") as index_file:
+            pickle.dump(
+                {
+                    "format_version": 2,
+                    "specification_name": specification_name.strip(),
+                    "bm25": bm25,
+                    "chunks": chunks,
+                },
+                index_file,
+            )
+        os.replace(temporary_path, path)
+        logger.info(f"Saved BM25 index for '{specification_name}'.")
+        return len(chunks)
     except Exception as e:
-        logger.error(f"Failed to build/save BM25 index: {e}")
-        # ChromaDB succeeded - partial success is still useful
-    return len(chunks)
+        logger.error(f"Failed to save BM25 index: {e}")
+        return 0
+
+
+def list_specifications() -> list[str]:
+    """Return original names from valid indexes, including compatible legacy files."""
+    names = set()
+    directories = (Path(BM25), *LEGACY_BM25_DIRS)
+    for directory in dict.fromkeys(directories):
+        if not directory.is_dir():
+            continue
+        for path in directory.glob("*.pkl"):
+            payload = _read_index(path)
+            if payload is None:
+                continue
+            name = _payload_specification_name(payload)
+            if name:
+                names.add(name)
+            else:
+                logger.warning(
+                    f"BM25 index '{path.name}' has no recoverable specification name; "
+                    "re-ingest its source to list it."
+                )
+    return sorted(names, key=str.casefold)
+
 
 def load_bm25(specification_name: str):
-    """Load persisted BM25 index. Returns (bm25, chunks) or (None, None)."""
-    path = bm25_path(specification_name)
-    if not os.path.exists(path):
-        logger.warning(f"BM25 index not found for '{specification_name}'.")
-        return None, None
-    try:
-        with open(path, "rb") as f:
-            payload = pickle.load(f)
+    """Return the BM25 index and chunks, or (None, None)."""
+    paths = [Path(bm25_path(specification_name)), *_legacy_bm25_paths(specification_name)]
+    for path in dict.fromkeys(paths):
+        payload = _read_index(path)
+        if payload is None:
+            continue
+        stored_name = _payload_specification_name(payload)
+        if not stored_name:
+            logger.warning(
+                f"BM25 index '{path.name}' has no recoverable specification name; "
+                "re-ingest its source."
+            )
+            continue
+        if stored_name.casefold() != specification_name.strip().casefold():
+            logger.warning(
+                f"Skipping BM25 index '{path.name}' because its stored name does not match."
+            )
+            continue
         return payload["bm25"], payload["chunks"]
-    except Exception as e:
-        logger.error(f"Failed to load BM25 index: {e}")
-        return None, None
 
-# Reciprocal Rank Fusion 
- 
+    logger.warning(f"BM25 index not found for '{specification_name}'.")
+    return None, None
 
-def rrf_fuse(dense_chunks: List[Dict], bm25_chunks: List[Dict], k: int = 60) -> List[Dict]:
-    """
-    Fuse dense and BM25 ranked lists using Reciprocal Rank Fusion.
-    Deduplicate API endpoints and keep document chunks distinct.
-    """
+
+def rrf_fuse(
+    dense_chunks: List[Dict],
+    bm25_chunks: List[Dict],
+    k: int = 60,
+) -> List[Dict]:
+    """Fuse ranked lists and avoid duplicate API endpoints."""
     scores: Dict[str, float] = {}
     index: Dict[str, Dict] = {}
 
     def _key(chunk: Dict) -> str:
         metadata = chunk.get("metadata", {})
-
-        # Preserve endpoint-based deduplication for OpenAPI chunks.
         method = metadata.get("method")
         path = metadata.get("path")
-
         if method and path:
             return f"endpoint:{method}:{path}"
-
-        # Keep document chunks distinct during hybrid retrieval.
         return f"document:{metadata.get('chunk_id', chunk['text'])}"
 
-    for rank, chunk in enumerate(dense_chunks):
-        key = _key(chunk)
-        scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
-        index[key] = chunk
-
-    for rank, chunk in enumerate(bm25_chunks):
-        key = _key(chunk)
-        scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
-        index[key] = chunk
+    for ranked_chunks in (dense_chunks, bm25_chunks):
+        for rank, chunk in enumerate(ranked_chunks):
+            key = _key(chunk)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+            index[key] = chunk
 
     ranked_keys = sorted(scores, key=lambda key: scores[key], reverse=True)
     return [index[key] for key in ranked_keys]
 
-# Cross-encoder re-ranking
+
 def rerank(query: str, chunks: List[Dict], top_n: int = 5) -> List[Dict]:
+    """Return the leading BM25 candidates without a transformer reranker."""
     if not chunks:
-        return chunks
-    try:
-        pairs = [(query, c["text"]) for c in chunks]
-        scores = cross_encoder.predict(pairs)
-        ranked = sorted(zip(scores, chunks), key=lambda x: x[0], reverse=True)
-        top = [chunk for _, chunk in ranked[:top_n]]
-        logger.info(f"Re-ranked {len(chunks)} chunks -> kept top {len(top)}.")
-        return top
-    except Exception as e:
-        logger.error(f"Re-ranking failed, returning original chunks: {e}")
-        return chunks[:top_n]
-    
-# Hybrid retrieval
+        return []
+    bm25, all_chunks = None, None
+    return chunks[:top_n]
+
+
 def retrieve_hybrid(
     query: str,
     specification_name: str,
     num_results: int = 20,
     rerank_top_n: int = 5,
 ) -> List[Dict]:
-    """
-    Two-stage hybrid retrieval:
- 
-    Stage 1 - Candidate generation (parallel):
-        • Dense:  embed query -> ChromaDB top-N
-        • BM25:   tokenize query -> BM25 top-N
-        • Fuse both lists with Reciprocal Rank Fusion (RRF)
- 
-    Stage 2 - Precision re-ranking:
-        • Cross-encoder scores every (query, candidate) pair
-        • Returns top rerank_top_n chunks
- 
-    Degrades gracefully: BM25-only if dense fails, dense-only if BM25
-    index is missing, empty list if both fail.
-    """
+    """Low-memory BM25-only retrieval."""
     if not query:
         logger.warning("Empty query provided.")
         return []
-    # Dense retrieval
-    dense_chunks: List[Dict] = []
-    try:
-        collection = client.get_or_create_collection(normalize_name(specification_name))
-        query_embedding = embedder.encode([query]).tolist()[0]
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=num_results,
-        )
-        if results["documents"] and results["documents"][0]:
-            dense_chunks = [
-                {"text": doc, "metadata": meta}
-                for doc, meta in zip(results["documents"][0], results["metadatas"][0] if results["metadatas"] else [])
-            ]
-            logger.info(f"Dense: {len(dense_chunks)} candidates.")
-    except Exception as e:
-        logger.error(f"Dense retrieval failed: {e}")
-    # BM25 retrieval
-    bm25_chunks: List[Dict] = []
+
     bm25, all_chunks = load_bm25(specification_name)
-    if bm25 and all_chunks:
-        try:
-            scores = bm25.get_scores(tokenize(query))
-            top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:num_results]
-            bm25_chunks = [all_chunks[i] for i in top_indices]
-            logger.info(f"BM25: {len(bm25_chunks)} candidates.")
-        except Exception as e:
-            logger.error(f"BM25 retrieval failed: {e}")
-    # Fallback handling
-    if not dense_chunks and not bm25_chunks:
-        logger.warning("Both retrievers returned empty.")
+    if bm25 is None or not all_chunks:
+        logger.warning(f"No BM25 index available for '{specification_name}'.")
         return []
-    if not dense_chunks:
-        logger.warning("Dense empty - BM25 only.")
-        return rerank(query, bm25_chunks, top_n=rerank_top_n)
-    if not bm25_chunks:
-        logger.warning("BM25 empty - dense only.")
-        return rerank(query, dense_chunks, top_n=rerank_top_n)
-    # RRF + re-rank
-    fused = rrf_fuse(dense_chunks, bm25_chunks)
-    logger.info(f"RRF: {len(fused)} unique candidates after fusion.")
-    return rerank(query, fused, top_n=rerank_top_n)
+
+    try:
+        scores = bm25.get_scores(tokenize(query))
+        top_indices = sorted(
+            range(len(scores)),
+            key=lambda i: scores[i],
+            reverse=True,
+        )[:num_results]
+
+        candidates = [all_chunks[i] for i in top_indices]
+        return candidates[:rerank_top_n]
+    except Exception as e:
+        logger.error(f"BM25 retrieval failed: {e}")
+        return []

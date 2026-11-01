@@ -1,5 +1,4 @@
 import json
-import os
 import time
 from typing import Literal
 
@@ -26,6 +25,7 @@ from llm import (
     build_retrieval_rewrite_prompt,
     build_specification_routing_prompt,
     get_llm_metrics,
+    get_provider_api_key,
     get_provider_config,
     provider_catalog,
     query_llm,
@@ -34,10 +34,9 @@ from llm import (
 from loggerConfig import get_logger
 from pydantic import BaseModel, Field
 from sources import format_chunk_reference, format_source
-from vectorStore import client, retrieve_hybrid, store_chunks
+from vectorStore import list_specifications, retrieve_hybrid, store_chunks
 
 load_dotenv()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 langfuse = get_client()
 
 logger = get_logger("main")
@@ -97,7 +96,38 @@ def run_retrieval(question: str, specification_name: str):
 
 
 def specification_names() -> list[str]:
-    return [collection.name for collection in client.list_collections()]
+    return list_specifications()
+
+
+def _extract_specification_chunks(specification: object) -> tuple[str, list[dict]]:
+    if not isinstance(specification, dict) or not isinstance(
+        specification.get("paths"), dict
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="The JSON must contain a valid API specification with paths.",
+        )
+
+    info = specification.get("info", {})
+    if not isinstance(info, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="The API specification must contain valid info metadata.",
+        )
+
+    title = info.get("title")
+    specification_name = (
+        title.strip()
+        if isinstance(title, str) and title.strip()
+        else "Unknown API"
+    )
+    chunks = extract_chunks(specification)
+    if not chunks:
+        raise HTTPException(
+            status_code=400,
+            detail="No usable API endpoints were found in the specification.",
+        )
+    return specification_name, chunks
 
 
 def retrieve_from_specifications(question: str, selected_specs: list[str]):
@@ -219,12 +249,14 @@ async def ingest(req: IngestRequest):
         if not specification:
             logger.error("Failed to fetch specification or empty response.")
             raise HTTPException(status_code=400, detail="Invalid or empty specification.")
-        specification_name = specification.get("info", {}).get("title", "Unknown API")
+        specification_name, chunks = _extract_specification_chunks(specification)
         logger.debug(f"Specification name: {specification_name}")
-        chunks = extract_chunks(specification)
-        if not chunks:
-            logger.warning("No chunks extracted from specification.")
         count = store_chunks(chunks, specification_name)
+        if count != len(chunks):
+            raise HTTPException(
+                status_code=500,
+                detail="The API specification could not be saved.",
+            )
         logger.info(f"Ingested {count} chunks for {specification_name}.")
         result = {
             "specification_name": specification_name,
@@ -271,16 +303,9 @@ async def ingest_file(file: UploadFile = File(...)):
                     detail="Invalid JSON file.",
                 )
 
-            if not isinstance(specification, dict) or not specification:
-                raise HTTPException(
-                    status_code=400,
-                    detail="The JSON file must contain a valid API specification.",
-                )
-
-            specification_name = (
-                specification.get("info", {}).get("title", "Unknown API")
+            specification_name, chunks = _extract_specification_chunks(
+                specification
             )
-            chunks = extract_chunks(specification)
             item_type = "endpoints"
 
         elif extension in ("pdf", "txt"):
@@ -307,6 +332,11 @@ async def ingest_file(file: UploadFile = File(...)):
             )
 
         count = store_chunks(chunks, specification_name)
+        if count != len(chunks):
+            raise HTTPException(
+                status_code=500,
+                detail="The uploaded document could not be saved.",
+            )
 
         logger.info(
             f"Ingested {count} {item_type} for {specification_name}."
@@ -336,36 +366,6 @@ async def ingest_file(file: UploadFile = File(...)):
             status_code=500,
             detail="Internal server error",
         )
-
-    logger.info(f"File ingest request received: {file.filename}")
-    langfuse.update_current_span(input={"filename": file.filename})
-    try:
-        content = await file.read()
-        specification = json.loads(content)
-        if not specification:
-            raise HTTPException(status_code=400, detail="Invalid or empty specification.")
-        specification_name = specification.get("info", {}).get("title", "Unknown API")
-        chunks = extract_chunks(specification)
-        count = store_chunks(chunks, specification_name)
-        logger.info(f"Ingested {count} chunks for {specification_name}.")
-        result = {
-            "specification_name": specification_name,
-            "chunks_stored": count,
-            "message": f"Successfully ingested {count} endpoints."
-        }
-        langfuse.update_current_span(output={
-            "specification_name": specification_name,
-            "chunks_stored": count
-        })
-        return result
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid or empty specification.")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"File ingest failed: {e}")
-        langfuse.update_current_span(output={"error": str(e)})
-        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/query")
 @observe(name="rag-query")
@@ -535,10 +535,15 @@ async def transcribe(file: UploadFile = File(...)):
         audio_bytes = await file.read()
         if not audio_bytes:
             raise HTTPException(status_code=400, detail="Empty audio file.")
+        try:
+            api_key = get_provider_api_key("groq")
+        except LLMProviderError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
                 "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                headers={"Authorization": f"Bearer {api_key}"},
                 files={"file": ("recording.webm", audio_bytes, file.content_type or "audio/webm")},
                 data={
                     "model": "whisper-large-v3-turbo",
@@ -556,9 +561,31 @@ async def transcribe(file: UploadFile = File(...)):
         return {"transcript": transcript}
     except HTTPException:
         raise
+    except httpx.TimeoutException as e:
+        logger.error("Groq transcription request timed out.")
+        raise HTTPException(
+            status_code=504,
+            detail="Transcription service timed out. Please try again.",
+        ) from e
     except httpx.HTTPStatusError as e:
-        logger.error(f"Groq API error: {e.response.status_code} — {e.response.text}")
-        raise HTTPException(status_code=502, detail="Transcription service error.")
+        status = e.response.status_code
+        logger.error(f"Groq transcription API returned HTTP {status}.")
+        if status in (401, 403):
+            detail = "Groq authentication failed. Check GROQ_API_KEY."
+        elif status == 429:
+            detail = "Groq rate limit reached. Please try again later."
+        else:
+            detail = "Transcription service error."
+        raise HTTPException(status_code=502, detail=detail) from e
+    except httpx.RequestError as e:
+        logger.error("Groq transcription request failed.")
+        raise HTTPException(
+            status_code=502,
+            detail="Could not reach the transcription service.",
+        ) from e
     except Exception as e:
-        logger.error(f"Transcribe failed: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        logger.error("Transcription failed due to an unexpected error.")
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error",
+        ) from e

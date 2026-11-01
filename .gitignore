@@ -9,6 +9,7 @@ node_modules/
 frontend/node_modules/
 chromaDB/
 backend/chromaDB/
+bm25_indexes/
 backend/bm25_indexes/
 *.log
 evals/reports/

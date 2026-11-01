@@ -1,7 +1,9 @@
 import json
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
 
 from llm import (
     LLMProviderError,
@@ -9,6 +11,7 @@ from llm import (
     build_llm_request,
     get_provider_config,
     provider_catalog,
+    query_llm,
 )
 
 
@@ -20,9 +23,12 @@ class LLMProviderTests(unittest.TestCase):
     def test_groq_request_uses_configured_model_and_compatible_stops(self):
         with patch.dict(os.environ, {"GROQ_API_KEY": "test-key"}):
             url, headers, payload = build_llm_request("hello", "groq")
+            authorization_matches_key = (
+                headers["Authorization"] == "Bearer " + os.environ["GROQ_API_KEY"]
+            )
 
         self.assertEqual(url, "https://api.groq.com/openai/v1/chat/completions")
-        self.assertEqual(headers["Authorization"], "Bearer test-key")
+        self.assertTrue(authorization_matches_key)
         self.assertEqual(payload["model"], "openai/gpt-oss-120b")
         self.assertEqual(payload["reasoning_effort"], "low")
         self.assertEqual(payload["max_completion_tokens"], 900)
@@ -45,6 +51,14 @@ class LLMProviderTests(unittest.TestCase):
             LLMProviderError, "GEMINI_API_KEY"
         ):
             build_llm_request("hello", "gemini")
+
+    def test_missing_groq_key_is_actionable_without_exposing_a_value(self):
+        test_key = "unit-test-groq-key"
+        with patch.dict(os.environ, {"GROQ_API_KEY": ""}):
+            with self.assertRaisesRegex(LLMProviderError, "GROQ_API_KEY") as raised:
+                build_llm_request("hello", "groq")
+
+        self.assertFalse(test_key in str(raised.exception))
 
     def test_provider_catalog_does_not_expose_keys(self):
         with patch.dict(os.environ, {"GROQ_API_KEY": "secret"}, clear=True):
@@ -203,6 +217,57 @@ class LLMProviderTests(unittest.TestCase):
         self.assertIn("- customer (string, optional)", prompt)
         self.assertIn("- items (array, optional)", prompt)
         self.assertLess(len(prompt), 6000)
+
+
+class GroqRequestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_query_missing_key_fails_before_network_request(self):
+        client_factory = MagicMock()
+
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("llm.httpx.AsyncClient", new=client_factory):
+                with self.assertRaisesRegex(LLMProviderError, "GROQ_API_KEY"):
+                    await query_llm("hello", "groq")
+
+        client_factory.assert_not_called()
+
+    async def test_query_sends_configured_bearer_key_without_logging_it(self):
+        test_key = "unit-test-groq-key"
+        response = MagicMock()
+        response.json.return_value = {
+            "choices": [{"message": {"content": "A safe answer."}}],
+        }
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+        client.post = AsyncMock(return_value=response)
+
+        with patch.dict(os.environ, {"GROQ_API_KEY": test_key}):
+            with patch("llm.httpx.AsyncClient", return_value=client):
+                with self.assertLogs("llm", level="INFO") as captured:
+                    answer = await query_llm("hello", "groq")
+
+        request = client.post.await_args
+        self.assertTrue(
+            request.kwargs["headers"]["Authorization"] == f"Bearer {test_key}"
+        )
+        self.assertEqual(answer, "A safe answer.")
+        self.assertFalse(test_key in "\n".join(captured.output))
+
+    async def test_query_timeout_returns_safe_error(self):
+        test_key = "unit-test-groq-key"
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+        client.post = AsyncMock(side_effect=httpx.TimeoutException("timeout"))
+
+        with patch.dict(os.environ, {"GROQ_API_KEY": test_key}):
+            with patch("llm.httpx.AsyncClient", return_value=client):
+                with self.assertLogs("llm", level="ERROR") as captured:
+                    with self.assertRaisesRegex(LLMProviderError, "timed out") as raised:
+                        await query_llm("hello", "groq")
+
+        self.assertFalse(test_key in str(raised.exception))
+        self.assertFalse(test_key in "\n".join(captured.output))
 
 
 if __name__ == "__main__":

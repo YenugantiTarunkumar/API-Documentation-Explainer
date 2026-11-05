@@ -1,16 +1,105 @@
+import ipaddress
 import json
 import re
+import socket
+from urllib.parse import urljoin, urlparse
+
 import fitz
 import httpx
 from loggerConfig import get_logger
 
 logger = get_logger("ingest")
 
+
+def is_safe_url(url: str) -> tuple[bool, str]:
+    """
+    Validate that a URL is safe to fetch and does not point to internal/private networks (SSRF protection).
+    Returns (is_safe, error_reason).
+    """
+    if not isinstance(url, str) or not url.strip():
+        return False, "URL cannot be empty."
+
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return False, "Invalid URL format."
+
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        return False, "Only HTTP and HTTPS protocols are supported."
+
+    hostname = parsed.hostname
+    if not hostname:
+        return False, "URL must contain a valid hostname."
+
+    lowered_host = hostname.lower().strip("[]")
+    if lowered_host in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "metadata.google.internal"):
+        return False, "Access to localhost and internal addresses is forbidden."
+
+    if lowered_host == "169.254.169.254":
+        return False, "Access to cloud metadata service is forbidden."
+
+    port = parsed.port or (443 if scheme == "https" else 80)
+    try:
+        addr_info = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return False, f"Could not resolve host '{hostname}'."
+    except Exception as e:
+        return False, f"Failed to resolve host '{hostname}': {e}"
+
+    if not addr_info:
+        return False, f"No IP addresses resolved for host '{hostname}'."
+
+    for _, _, _, _, sockaddr in addr_info:
+        ip_str = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+                ip = ip.ipv4_mapped
+
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+            ):
+                return False, f"Access to private or internal network address ({ip}) is forbidden."
+        except ValueError:
+            return False, "Invalid IP address encountered during host resolution."
+
+    return True, ""
+
+
 # fetching specifications
 def fetch_specification(url: str) -> dict:
+    is_safe, reason = is_safe_url(url)
+    if not is_safe:
+        logger.warning(f"SSRF validation blocked request to '{url}': {reason}")
+        raise ValueError(reason)
+
     try:
         logger.info(f"Fetching specification from {url}")
-        response = httpx.get(url, timeout=10.0)
+        current_url = url
+        response = None
+        for _ in range(3):
+            response = httpx.get(current_url, timeout=10.0, follow_redirects=False)
+            if response.is_redirect:
+                redirect_location = response.headers.get("location")
+                if not redirect_location:
+                    break
+                current_url = urljoin(current_url, redirect_location)
+                is_safe_redir, redir_reason = is_safe_url(current_url)
+                if not is_safe_redir:
+                    logger.warning(f"SSRF validation blocked redirect to '{current_url}': {redir_reason}")
+                    raise ValueError(f"Redirect blocked: {redir_reason}")
+                continue
+            break
+
+        if response is None:
+            raise ValueError("No response received from specification URL.")
+
         response.raise_for_status()   # Raises error if: 4xx (client error) or 5xx (server error)
         try:
             data = response.json()
@@ -19,6 +108,8 @@ def fetch_specification(url: str) -> dict:
         except json.JSONDecodeError:
             logger.error("Response is not valid JSON.")
             return {}
+    except ValueError:
+        raise
     except httpx.RequestError as e:
         logger.error(f"Request failed: {e}.")
         return {}

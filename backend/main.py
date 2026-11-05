@@ -1,6 +1,15 @@
 import json
+import os
+import re
+import sys
 import time
+import uuid
+from pathlib import Path
 from typing import Literal
+
+BACKEND_DIR = Path(__file__).resolve().parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
 
 import httpx
 from agent import (
@@ -9,7 +18,7 @@ from agent import (
 )
 from confidence import score_confidence
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from ingest import (
     extract_chunks,
@@ -34,7 +43,14 @@ from llm import (
 from loggerConfig import get_logger
 from pydantic import BaseModel, Field
 from sources import format_chunk_reference, format_source
-from vectorStore import list_specifications, retrieve_hybrid, store_chunks
+from vectorStore import (
+    delete_document_index,
+    has_document_index,
+    list_specifications,
+    load_document_bm25,
+    retrieve_hybrid,
+    store_chunks,
+)
 
 load_dotenv()
 langfuse = get_client()
@@ -44,15 +60,34 @@ ALL_SPECIFICATIONS = "__all__"
 
 app = FastAPI(title="DocQuery")
 
+MAX_UPLOAD_SIZE = 25 * 1024 * 1024  # 25 MB
+VALID_DOC_ID_REGEX = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
+
+def check_document_id(doc_id: str | None) -> str | None:
+    if doc_id is None:
+        return None
+    cleaned = doc_id.strip()
+    if not cleaned or not VALID_DOC_ID_REGEX.match(cleaned):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid document_id format. Must be 1-64 alphanumeric characters, hyphens, or underscores.",
+        )
+    return cleaned
+
+
+custom_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://api-documentation-explainer.vercel.app",
+    *custom_origins,
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"^https://api-documentation-explainer(-[a-z0-9-]+)?\.vercel\.app$",
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -60,6 +95,7 @@ app.add_middleware(
 
 class IngestRequest(BaseModel):
     specification_url: str
+    document_id: str | None = None
 
 class ConversationTurn(BaseModel):
     question: str
@@ -67,23 +103,30 @@ class ConversationTurn(BaseModel):
 
 class QueryRequest(BaseModel):
     question: str
-    specification_name: str
+    specification_name: str | None = None
+    document_id: str | None = None
+    conversation_id: str | None = None
     history: list[ConversationTurn] = Field(default_factory=list)
     llm_provider: Literal["groq", "gemini", "huggingface"] = "groq"
 
 
 # Observed helpers
 @observe(name="hybrid-retrieval")
-def run_retrieval(question: str, specification_name: str):
+def run_retrieval(
+    question: str,
+    specification_name: str | None = None,
+    document_id: str | None = None,
+):
     chunks = retrieve_hybrid(
         query=question,
         specification_name=specification_name,
+        document_id=document_id,
         num_results=20,
         rerank_top_n=5,
     )
     # Log what was retrieved so it's visible in the span
     langfuse.update_current_span(
-        input={"question": question, "specification": specification_name},
+        input={"question": question, "specification": specification_name, "document_id": document_id},
         output={
             "chunks_returned": len(chunks) if chunks else 0,
             "sources": [
@@ -135,7 +178,7 @@ def retrieve_from_specifications(question: str, selected_specs: list[str]):
     results_by_spec = []
     for specification_name in selected_specs:
         tagged = []
-        for chunk in run_retrieval(question, specification_name):
+        for chunk in run_retrieval(question, specification_name=specification_name):
             tagged.append({
                 **chunk,
                 "metadata": {
@@ -240,30 +283,38 @@ async def generate_answer(question: str, chunks: list[dict], provider: str):
 @app.post("/ingest")
 @observe(name="ingest")
 async def ingest(req: IngestRequest):
+    if req.document_id:
+        check_document_id(req.document_id)
     logger.info(f"Ingest request received: {req.specification_url}")
     langfuse.update_current_span(
-        input={"url": req.specification_url}
+        input={"url": req.specification_url, "document_id": req.document_id}
     )
     try:
-        specification = fetch_specification(req.specification_url)
+        try:
+            specification = fetch_specification(req.specification_url)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         if not specification:
             logger.error("Failed to fetch specification or empty response.")
             raise HTTPException(status_code=400, detail="Invalid or empty specification.")
         specification_name, chunks = _extract_specification_chunks(specification)
         logger.debug(f"Specification name: {specification_name}")
-        count = store_chunks(chunks, specification_name)
+        doc_id = req.document_id or f"doc_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        count = store_chunks(chunks, specification_name, document_id=doc_id)
         if count != len(chunks):
             raise HTTPException(
                 status_code=500,
                 detail="The API specification could not be saved.",
             )
-        logger.info(f"Ingested {count} chunks for {specification_name}.")
+        logger.info(f"Ingested {count} chunks for {specification_name} (document_id={doc_id}).")
         result = {
+            "document_id": doc_id,
             "specification_name": specification_name,
             "chunks_stored": count,
             "message": f"Successfully ingested {count} endpoints."
         }
         langfuse.update_current_span(output={
+            "document_id": doc_id,
             "specification_name": specification_name,
             "chunks_stored": count
         })
@@ -278,10 +329,16 @@ async def ingest(req: IngestRequest):
 
 @app.post("/ingest/file")
 @observe(name="ingest-file")
-async def ingest_file(file: UploadFile = File(...)):
+async def ingest_file(
+    file: UploadFile = File(...),
+    document_id: str | None = Form(None),
+):
+    if document_id:
+        check_document_id(document_id)
     filename = file.filename or "uploaded_file"
-    logger.info(f"File ingest request received: {filename}")
-    langfuse.update_current_span(input={"filename": filename})
+    doc_id = document_id or f"doc_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+    logger.info(f"File ingest request received: {filename} (document_id={doc_id})")
+    langfuse.update_current_span(input={"filename": filename, "document_id": doc_id})
 
     try:
         content = await file.read()
@@ -290,6 +347,11 @@ async def ingest_file(file: UploadFile = File(...)):
             raise HTTPException(
                 status_code=400,
                 detail="The uploaded file is empty.",
+            )
+        if len(content) > MAX_UPLOAD_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File exceeds maximum allowed size of {MAX_UPLOAD_SIZE // (1024 * 1024)} MB.",
             )
 
         extension = filename.lower().rsplit(".", 1)[-1]
@@ -331,7 +393,7 @@ async def ingest_file(file: UploadFile = File(...)):
                 detail="No usable content was found in the uploaded file.",
             )
 
-        count = store_chunks(chunks, specification_name)
+        count = store_chunks(chunks, specification_name, document_id=doc_id)
         if count != len(chunks):
             raise HTTPException(
                 status_code=500,
@@ -339,10 +401,11 @@ async def ingest_file(file: UploadFile = File(...)):
             )
 
         logger.info(
-            f"Ingested {count} {item_type} for {specification_name}."
+            f"Ingested {count} {item_type} for {specification_name} (document_id={doc_id})."
         )
 
         result = {
+            "document_id": doc_id,
             "specification_name": specification_name,
             "chunks_stored": count,
             "message": f"Successfully ingested {count} {item_type}.",
@@ -350,6 +413,7 @@ async def ingest_file(file: UploadFile = File(...)):
 
         langfuse.update_current_span(
             output={
+                "document_id": doc_id,
                 "specification_name": specification_name,
                 "chunks_stored": count,
                 "item_type": item_type,
@@ -380,12 +444,21 @@ async def query(req: QueryRequest):
       6. If confidence is low, rewrite retrieval and make one corrective attempt.
       7. Return the attempt with the stronger grounding score.
     """
+    if not req.question or not req.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    if req.document_id:
+        check_document_id(req.document_id)
+    if req.conversation_id:
+        check_document_id(req.conversation_id)
+
     started_at = time.perf_counter()
     provider = req.llm_provider
     provider_config = get_provider_config(provider)
     reset_llm_metrics()
+
+    target_name = req.specification_name or (f"document_id:{req.document_id}" if req.document_id else "unknown")
     logger.info(
-        f"Query received for specification: {req.specification_name} "
+        f"Query received for: {target_name} "
         f"using {provider_config['label']}"
     )
     # Log the user's question as the trace input — visible at the top level in Langfuse
@@ -393,6 +466,8 @@ async def query(req: QueryRequest):
         input={
             "question": req.question,
             "specification": req.specification_name,
+            "document_id": req.document_id,
+            "conversation_id": req.conversation_id,
             "history_length": len(req.history),
             "llm_provider": provider,
         }
@@ -415,29 +490,71 @@ async def query(req: QueryRequest):
 
         history = [
             {"question": turn.question, "answer": turn.answer}
-            for turn in req.history
+            for turn in (req.history[-20:] if req.history else [])
         ]
-        available_specs = specification_names()
 
-        def retrieve_selected(question: str, selected_specs: list[str]):
-            return retrieve_from_specifications(question, selected_specs)
+        if req.document_id:
+            if not has_document_index(req.document_id):
+                logger.warning(f"Document index for '{req.document_id}' not found.")
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Document index for '{req.document_id}' not found. Please re-ingest the document.",
+                )
+            _, doc_chunks, doc_spec_name = load_document_bm25(req.document_id)
+            active_spec_name = req.specification_name or doc_spec_name or "Uploaded Document"
+            available_specs = [active_spec_name]
 
-        result = await run_agent_graph(
-            question=req.question,
-            history=history,
-            specification_name=req.specification_name,
-            available_specifications=available_specs,
-            contextualize=contextualize,
-            route=route,
-            retrieve=retrieve_selected,
-            generate=generate,
-            score=score_confidence,
-            rewrite=rewrite,
-            decompose=decompose,
-            max_chunks=provider_config["max_chunks"],
-            workflow_confidence_threshold=60 if provider == "groq" else 70,
-            all_specifications_value=ALL_SPECIFICATIONS,
-        )
+            def retrieve_selected(question: str, _selected_specs: list[str]):
+                return run_retrieval(
+                    question,
+                    specification_name=active_spec_name,
+                    document_id=req.document_id,
+                )
+
+            result = await run_agent_graph(
+                question=req.question,
+                history=history,
+                specification_name=active_spec_name,
+                available_specifications=available_specs,
+                contextualize=contextualize,
+                route=route,
+                retrieve=retrieve_selected,
+                generate=generate,
+                score=score_confidence,
+                rewrite=rewrite,
+                decompose=decompose,
+                max_chunks=provider_config["max_chunks"],
+                workflow_confidence_threshold=60 if provider == "groq" else 70,
+                all_specifications_value=ALL_SPECIFICATIONS,
+            )
+        else:
+            if not req.specification_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Either document_id or specification_name is required.",
+                )
+            available_specs = specification_names()
+
+            def retrieve_selected(question: str, selected_specs: list[str]):
+                return retrieve_from_specifications(question, selected_specs)
+
+            result = await run_agent_graph(
+                question=req.question,
+                history=history,
+                specification_name=req.specification_name,
+                available_specifications=available_specs,
+                contextualize=contextualize,
+                route=route,
+                retrieve=retrieve_selected,
+                generate=generate,
+                score=score_confidence,
+                rewrite=rewrite,
+                decompose=decompose,
+                max_chunks=provider_config["max_chunks"],
+                workflow_confidence_threshold=60 if provider == "groq" else 70,
+                all_specifications_value=ALL_SPECIFICATIONS,
+            )
+
         if not result.chunks:
             logger.warning("No chunks found for query.")
             raise HTTPException(
@@ -473,6 +590,8 @@ async def query(req: QueryRequest):
                 "sources": sources,
                 "llm": llm,
                 "latency_ms": elapsed_ms,
+                "document_id": req.document_id,
+                "conversation_id": req.conversation_id,
                 "agent": {
                     "attempts": result.attempts,
                     "retried": result.retried,
@@ -486,6 +605,8 @@ async def query(req: QueryRequest):
         # Confidence as a 0-1 metric — shows up in Langfuse's scores tab and dashboard charts
         langfuse.score_current_trace(name="confidence", value=result.confidence / 100)
         return {
+            "document_id": req.document_id,
+            "conversation_id": req.conversation_id,
             "answer": result.answer,
             "confidence": result.confidence,
             "sources": sources,
@@ -510,6 +631,36 @@ async def query(req: QueryRequest):
         logger.error(f"Query failed: {e}")
         langfuse.update_current_span(output={"error": str(e)})
         raise HTTPException(status_code=500, detail="Internal server error")
+
+# Document status and deletion endpoints
+
+@app.get("/documents/{document_id}/status")
+def get_document_status(document_id: str):
+    check_document_id(document_id)
+    if not has_document_index(document_id):
+        return {
+            "document_id": document_id,
+            "exists": False,
+            "specification_name": None,
+            "chunks_count": 0,
+        }
+    _, chunks, spec_name = load_document_bm25(document_id)
+    return {
+        "document_id": document_id,
+        "exists": True,
+        "specification_name": spec_name,
+        "chunks_count": len(chunks) if chunks else 0,
+    }
+
+@app.delete("/documents/{document_id}")
+def delete_document(document_id: str):
+    check_document_id(document_id)
+    deleted = delete_document_index(document_id)
+    return {
+        "document_id": document_id,
+        "deleted": True,
+        "message": "Document index deleted successfully." if deleted else "Document index already removed.",
+    }
 
 # List Specifications
 @app.get("/llm/providers")

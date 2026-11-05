@@ -1,9 +1,9 @@
-
 import hashlib
 import os
+import re
 import pickle
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from rank_bm25 import BM25Okapi
 from loggerConfig import get_logger
@@ -36,6 +36,25 @@ def bm25_path(specification_name: str) -> str:
         specification_name.strip().encode("utf-8")
     ).hexdigest()[:16]
     return str(Path(BM25) / f"{normalize_name(specification_name)}-{digest}.pkl")
+
+
+VALID_DOC_ID_REGEX = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+
+def sanitize_document_id(document_id: str) -> str:
+    """Validate and return safe document_id. Raises ValueError if invalid."""
+    if not document_id or not isinstance(document_id, str):
+        raise ValueError("A valid non-empty document_id is required.")
+    cleaned = document_id.strip()
+    if not VALID_DOC_ID_REGEX.match(cleaned):
+        raise ValueError("Invalid document_id format. Must match [a-zA-Z0-9_-]{1,64}.")
+    return cleaned
+
+
+def document_bm25_path(document_id: str) -> str:
+    """Return the filesystem path for a document-isolated BM25 index."""
+    safe_id = sanitize_document_id(document_id)
+    return str(Path(BM25) / f"doc_{safe_id}.pkl")
 
 
 def _legacy_bm25_paths(specification_name: str) -> list[Path]:
@@ -94,7 +113,16 @@ def _read_index(path: Path) -> Dict | None:
         return None
 
 
-def store_chunks(chunks: List[Dict], specification_name: str) -> int:
+def store_chunks(
+    chunks: List[Dict],
+    specification_name: str,
+    document_id: str | None = None,
+) -> int:
+    """
+    Store chunks and pre-built BM25 index.
+    If document_id is provided, stores an isolated index mapped to document_id.
+    Also maintains specification-name lookup for backward compatibility.
+    """
     if not chunks:
         logger.warning("No chunks provided for storage.")
         return 0
@@ -114,21 +142,34 @@ def store_chunks(chunks: List[Dict], specification_name: str) -> int:
         texts = [c["text"] for c in chunks]
         tokenized = [tokenize(text) for text in texts]
         bm25 = BM25Okapi(tokenized)
+
+        payload = {
+            "format_version": 3,
+            "document_id": document_id,
+            "specification_name": specification_name.strip(),
+            "bm25": bm25,
+            "chunks": chunks,
+        }
+
+        # 1. If document_id is provided, store under document_bm25_path
+        if document_id:
+            doc_p = Path(document_bm25_path(document_id))
+            doc_p.parent.mkdir(parents=True, exist_ok=True)
+            temp_doc_p = doc_p.with_suffix(doc_p.suffix + ".tmp")
+            with temp_doc_p.open("wb") as index_file:
+                pickle.dump(payload, index_file)
+            os.replace(temp_doc_p, doc_p)
+            logger.info(f"Saved document-isolated BM25 index for document_id='{document_id}'.")
+
+        # 2. Also save to specification path for backward compatibility
         path = Path(bm25_path(specification_name))
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = path.with_suffix(path.suffix + ".tmp")
         with temporary_path.open("wb") as index_file:
-            pickle.dump(
-                {
-                    "format_version": 2,
-                    "specification_name": specification_name.strip(),
-                    "bm25": bm25,
-                    "chunks": chunks,
-                },
-                index_file,
-            )
+            pickle.dump(payload, index_file)
         os.replace(temporary_path, path)
         logger.info(f"Saved BM25 index for '{specification_name}'.")
+
         return len(chunks)
     except Exception as e:
         logger.error(f"Failed to save BM25 index: {e}")
@@ -143,6 +184,8 @@ def list_specifications() -> list[str]:
         if not directory.is_dir():
             continue
         for path in directory.glob("*.pkl"):
+            if path.name.startswith("doc_"):
+                continue
             payload = _read_index(path)
             if payload is None:
                 continue
@@ -182,6 +225,60 @@ def load_bm25(specification_name: str):
     return None, None
 
 
+def load_document_bm25(document_id: str) -> Tuple[BM25Okapi | None, list[dict] | None, str | None]:
+    """Return (BM25, chunks, specification_name) for a specific document_id."""
+    if not document_id:
+        return None, None, None
+    try:
+        path = Path(document_bm25_path(document_id))
+    except ValueError:
+        logger.warning(f"Invalid document_id='{document_id}' passed to load_document_bm25.")
+        return None, None, None
+    payload = _read_index(path)
+    if payload is None:
+        logger.warning(f"Document BM25 index not found for document_id='{document_id}'.")
+        return None, None, None
+    return payload["bm25"], payload["chunks"], payload.get("specification_name")
+
+
+def has_document_index(document_id: str) -> bool:
+    """Check if an index exists and is valid for document_id."""
+    if not document_id:
+        return False
+    try:
+        path = Path(document_bm25_path(document_id))
+    except ValueError:
+        return False
+    if not path.is_file():
+        return False
+    return _read_index(path) is not None
+
+
+def delete_document_index(document_id: str) -> bool:
+    """Delete the BM25 index associated with document_id."""
+    if not document_id:
+        return False
+    try:
+        path = Path(document_bm25_path(document_id))
+    except ValueError:
+        return False
+    deleted = False
+    if path.is_file():
+        try:
+            path.unlink()
+            deleted = True
+            logger.info(f"Deleted document index file for document_id='{document_id}'.")
+        except Exception as e:
+            logger.error(f"Failed to delete index file for document_id='{document_id}': {e}")
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    if temp_path.is_file():
+        try:
+            temp_path.unlink()
+        except Exception:
+            pass
+    return deleted
+
+
 def rrf_fuse(
     dense_chunks: List[Dict],
     bm25_chunks: List[Dict],
@@ -213,24 +310,37 @@ def rerank(query: str, chunks: List[Dict], top_n: int = 5) -> List[Dict]:
     """Return the leading BM25 candidates without a transformer reranker."""
     if not chunks:
         return []
-    bm25, all_chunks = None, None
     return chunks[:top_n]
 
 
 def retrieve_hybrid(
     query: str,
-    specification_name: str,
+    specification_name: str | None = None,
+    document_id: str | None = None,
     num_results: int = 20,
     rerank_top_n: int = 5,
 ) -> List[Dict]:
-    """Low-memory BM25-only retrieval."""
+    """
+    BM25 retrieval.
+    If document_id is provided, strictly retrieves from that document's isolated index.
+    Otherwise, retrieves from specification_name.
+    """
     if not query:
         logger.warning("Empty query provided.")
         return []
 
-    bm25, all_chunks = load_bm25(specification_name)
-    if bm25 is None or not all_chunks:
-        logger.warning(f"No BM25 index available for '{specification_name}'.")
+    if document_id:
+        bm25, all_chunks, _ = load_document_bm25(document_id)
+        if bm25 is None or not all_chunks:
+            logger.warning(f"No document BM25 index available for document_id='{document_id}'.")
+            return []
+    elif specification_name:
+        bm25, all_chunks = load_bm25(specification_name)
+        if bm25 is None or not all_chunks:
+            logger.warning(f"No BM25 index available for '{specification_name}'.")
+            return []
+    else:
+        logger.warning("Neither document_id nor specification_name provided to retrieve_hybrid.")
         return []
 
     try:
